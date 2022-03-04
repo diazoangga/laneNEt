@@ -1,18 +1,31 @@
 from selectors import DefaultSelector
 import tensorflow as tf
-from tensorflow.keras.layers import GlobalAveragePooling2D, Add, Conv2D, Input, DepthwiseConv2D, BatchNormalization, ReLU, Layer, MaxPool2D
+from tensorflow.keras.layers import UpSampling2D, GlobalAveragePooling2D, AveragePooling2D, Add, Conv2D, Input, DepthwiseConv2D, BatchNormalization, ReLU, Layer, MaxPool2D
 from tensorflow.keras import Model
 
 class BiseNetV2(Model):
     def __init__(self):
         super(BiseNetV2, self).__init__()
-        self.detail_branch = DetailBranch(name='detail_branch')
-        self.semantic_branch = SemanticBranch(prepare_data_for_booster=False,
-                                                    name='semantic_branch')
-        self.aggregation_branch = AggregationBranch(name='aggregation_branch')
+        self.detail_branch = DetailBranch()
+        self.semantic_branch = SemanticBranch()
+        self.aggregation_branch = AggregationBranch(128)
+        self.bin_segmentation = BinarySegmentation(2)
+        self.inst_segmentation = InstanceSegmentation(4)
     
-    def call(self, input_tensors):
-        pass
+    def call(self, input_tensor):
+        d_branch = self.detail_branch(input_tensor)
+        s_branch = self.semantic_branch(input_tensor)
+        agg_brang = self.aggregation_branch(d_branch, s_branch)
+        
+        bin_logits = self.bin_segmentation(agg_brang)
+        bin_pred = tf.argmax(tf.nn.softmax(bin_logits, axis=-1))
+        inst_seg = self.inst_segmentation(agg_brang)
+        
+        return {
+            'binary_logits': bin_logits, 
+            'binary_prediction': bin_pred, 
+            'instance_prediction': inst_seg
+            }
 
 
 class ConvBlock(Layer):
@@ -106,14 +119,15 @@ class DWBlock(Layer):
 class ContextEmbedding(Layer):
     def __init__(self, out_ch):
         super(ContextEmbedding, self).__init__()
-        self.ga_pool = GlobalAveragePooling2D(data_format='channels_last')
+        self.ga_pool = GlobalAveragePooling2D(keepdims=True)
         self.ga_pool_bn = BatchNormalization()
         self.conv_1 = ConvBlock(out_ch, 1, strides=1, padding='SAME')
-        self.conv_2 = Conv2D(out_ch, 3, strides=3, padding='SAME')
+        self.conv_2 = Conv2D(out_ch, 3, strides=1, padding='SAME')
 
     def call(self, input_tensor):
         out = self.ga_pool(input_tensor)
         out = self.ga_pool_bn(out)
+        #print(out.get_shape())
         out = self.conv_1(out)
         out = Add()([out, input_tensor])
         out = self.conv_2(out)
@@ -151,27 +165,117 @@ class DetailBranch(Layer):
 
 class SemanticBranch(Layer):
     def __init__(self):
-        arch = {
+        super(SemanticBranch, self).__init__()
+        self.arch = {
             'stage_1': [['stem',3, 16, 0, 4, 1]],
             'stage_3': [['ge', 3, 32, 6, 2, 1], ['ge', 3, 32, 6, 1, 1]],
             'stage_4': [['ge', 3, 64, 6, 2, 1], ['ge', 3, 64, 6, 1, 1]],
-            'stage_5': [['ge', 3, 128, 6, 2, 1], ['ge', 3, 128, 6, 1, 3], ['ce', 128, 0, 1, 1]]
+            'stage_5': [['ge', 3, 128, 6, 2, 1], ['ge', 3, 128, 6, 1, 3], ['ce', 3, 128, 0, 1, 1]]
         }
         self.layer = {}
-        stage = sorted(arch)
-        
-    def call(self):
-        pass
+        stage = sorted(self.arch)
+        temp = None
+        for stage_idx in stage:
+            for idx, info in enumerate(self.arch[stage_idx]):
+                #print(globals()[f'{stage_idx}_{idx}_conv'])
+                var = info
+                opr_type = var[0]
+                k_size = var[1]
+                out_ch = var[2]
+                depth_multi = var[3]
+                strides = var[4]
+                repeat = info[5]
+                for r in range(repeat):
+                    #print(temp, out_ch)
+                    if opr_type == 'stem':
+                        self.layer['self.{}_{}_{}_{}'.format(stage_idx, idx, opr_type, r)] =\
+                            StemBlock(out_ch)
+                    if opr_type == 'ge':
+                        self.layer['self.{}_{}_{}_{}'.format(stage_idx, idx, opr_type, r)] =\
+                            GatherExpansion(temp, out_ch, strides)
+                    if opr_type == 'ce':
+                        self.layer['self.{}_{}_{}_{}'.format(stage_idx, idx, opr_type, r)] =\
+                            ContextEmbedding(out_ch)
+                    temp = out_ch
+    def call(self, input_tensors):
+        out = input_tensors
+        layer = sorted(self.layer)
+        for item in layer:
+            out = self.layer[item](out)
+        return out
 
 class AggregationBranch(Layer):
-    def __init__(self):
-        pass
-    def call(self):
-        pass
+    def __init__(self, out_ch):
+        super(AggregationBranch, self).__init__()
+        self.d_branch_1_dw = DWBlock(3, strides=1, d_multiplier=1, padding='SAME')
+        self.d_branch_1_conv = Conv2D(out_ch, 1, strides=1, padding='SAME')
+        self.d_branch_2_conv = ConvBlock(out_ch, 3, strides=2, padding='SAME', activation=False)
+        self.d_branch_2_apool = AveragePooling2D(pool_size=(3,3), strides=2, padding='SAME')
+        self.s_branch_1_dw = DWBlock(3, strides=1, d_multiplier=1, padding='SAME')
+        self.s_branch_1_conv = Conv2D(out_ch, 1, strides=1, padding='SAME', activation='sigmoid')
+        self.s_branch_2_conv = ConvBlock(out_ch, 3, strides=1, padding='SAME', activation=False)
+        self.s_branch_2_upsample = UpSampling2D(size=(4,4), interpolation='bilinear')
+        self.s_branch_3_upsample = UpSampling2D(size=(4,4), interpolation='bilinear')
+        self.main_conv = ConvBlock(out_ch, 3, strides=1, padding='SAME', activation=False)
+        
+    def call(self, detail_branch, semantic_branch):
+        d_branch_main = self.d_branch_1_dw(detail_branch)
+        d_branch_main = self.d_branch_1_conv(d_branch_main)
+        d_branch_sub = self.d_branch_2_conv(detail_branch)
+        d_branch_sub = self.d_branch_2_apool(d_branch_sub)
+        s_branch_main = self.s_branch_1_dw(semantic_branch)
+        s_branch_main = self.s_branch_1_conv(s_branch_main)
+        s_branch_sub = self.s_branch_2_conv(semantic_branch)
+        s_branch_sub = self.s_branch_2_upsample(s_branch_sub)
+        s_branch_sub = tf.keras.activations.sigmoid(s_branch_sub)
+        
+        d_branch = tf.math.multiply(d_branch_main, s_branch_sub)
+        s_branch = tf.math.multiply(s_branch_main, d_branch_sub)
+        s_branch = self.s_branch_3_upsample(s_branch)
+
+        out = Add()([d_branch, s_branch])
+        out = self.main_conv(out)
+        
+        return out
+
+class BinarySegmentation(Layer):
+    def __init__(self, cls_num):
+        super(BinarySegmentation, self).__init__()
+        self.conv1 = ConvBlock(64, 1, strides=1, padding='SAME')
+        self.conv2 = ConvBlock(128, 1, strides=1, padding='SAME')
+        self.conv3 = ConvBlock(cls_num, 1, strides=1, padding='SAME', activation=False)
+        
+        upsample_size = 8
+        self.upsample = UpSampling2D(size=upsample_size, interpolation='bilinear')
+        
+    def call(self, input_tensor):
+        out = self.conv1(input_tensor)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out = self.upsample(out)
+        
+        return out
 
 
-inputs = Input([64,128,32])
-m = GatherExpansion(32, 32, 1)
-out = m(inputs)
-model = Model(inputs, out)
-model.summary()
+class InstanceSegmentation(Layer):
+    def __init__(self, inst_n):
+        super(InstanceSegmentation, self).__init__()
+        self.conv1 = ConvBlock(64, 1, strides=1, padding='SAME')
+        self.conv2 = ConvBlock(128, 1, strides=1, padding='SAME')
+        self.conv3 = ConvBlock(inst_n, 1, strides=1, padding='SAME', activation=False)
+        
+        upsample_size = 8
+        self.upsample = UpSampling2D(size=upsample_size, interpolation='bilinear')
+        
+    def call(self, input_tensor):
+        out = self.conv1(input_tensor)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out = self.upsample(out)
+        
+        return out
+# inputs = Input([256, 512, 3])
+# m = BiseNetV2()
+# out = m(inputs)
+# model = Model(inputs=inputs, outputs=out)
+# model.summary()
