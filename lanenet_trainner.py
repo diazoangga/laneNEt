@@ -1,6 +1,9 @@
 """
 Tusimple lanenet trainner
 """
+import absl.logging
+absl.logging.set_verbosity(absl.logging.ERROR)
+
 import os
 import os.path as ops
 from pickletools import optimize
@@ -18,7 +21,8 @@ import tqdm
 import cv2
 
 from data_provider import lanenet_data_feed_piplinep
-from lanenet_model import lanenet
+from lanenet_model import lanenet_p as lanenet
+from semantic_segmentation_zoo.bisenetv2 import *
 
 from lanenet_model.custom_loss import LossFunction
 from lanenet_model.lanenet_discriminative_loss import discriminative_loss
@@ -107,7 +111,10 @@ class LaneNetTusimpleTrainer(object):
             self.optimizer = tf.keras.optimizers.SGD(learning_rate=lrate,
                                                     momentum=self._momentum)
 
-        self._model = lanenet.LaneNet('train', self._cfg)
+        #self._model = lanenet.LaneNet('train', self._cfg)
+        self._model = BiseNetV2()
+        self._model = self._model.build_model([256, 512, 3])
+        self.overfit = False
         # print(np.unique(self._input_instance_label_image.numpy()))
         # for img in self._input_instance_label_image.numpy():
         #     try:
@@ -117,8 +124,8 @@ class LaneNetTusimpleTrainer(object):
         #         print('cant show img')
         #         continue
         print(self._batch_size)
-        self.train_dataset = self._train_dataset.next_batch(batch_size=self._batch_size)
-        self.val_dataset = self._val_dataset.next_batch(batch_size=self._val_batch_size)
+        #self.train_dataset = self._train_dataset.next_batch(batch_size=self._batch_size)
+        #self.val_dataset = self._val_dataset.next_batch(batch_size=self._val_batch_size)
 
         self.metrics = tf.keras.metrics.MeanIoU(2)
         self.val_metrics = tf.keras.metrics.MeanIoU(2)
@@ -135,12 +142,12 @@ class LaneNetTusimpleTrainer(object):
             train_epoch_miou = []
             tprogress_bar = tqdm.tqdm(range(1, self._steps_per_epoch), position=0, leave=True)
             for _ in tprogress_bar:    
-                input_src_img, input_bin_label, input_inst_label = self.train_dataset
+                input_src_img, input_bin_label, input_inst_label = self._train_dataset.next_batch()
                 #print(step, input_src_img.shape, input_bin_label.shape, input_inst_label.shape)
-                # for img in input_src_img:
-                #     #print(img)
-                #     cv2.imshow('s', img.numpy())
-                #     cv2.waitKey(0)
+        #         for img in input_src_img:
+        #             #print(img)
+        #             cv2.imshow('s', img.numpy())
+        #             cv2.waitKey(0)
                 with tf.GradientTape() as tape:
                     #tape.watch(train_var_list)
                     out_model = self._model(input_src_img, training=True)
@@ -189,7 +196,7 @@ class LaneNetTusimpleTrainer(object):
             val_epoch_miou = []
 
             for _ in range(self._val_batch_size):
-                val_src_img, val_bin_label, val_inst_label = self.val_dataset
+                val_src_img, val_bin_label, val_inst_label = self._val_dataset.next_batch()
                 val_out = self._model(val_src_img, training=False)
                 val_bin_logits = val_out['binary_logits']
                 val_bin_pred = val_out['binary_prediction']
@@ -226,24 +233,29 @@ class LaneNetTusimpleTrainer(object):
                     val_epoch_miou
                 )
             )
-            overfit = self.check_overfitting(val_epoch_loss, 5)
+            if epoch > self._warmup_epoches:
+                self.overfit = self.check_overfitting(val_epoch_loss, 5)
             if epoch % self._snapshot_epoch == 0:
                 self.save_checkpoint(train_epoch_miou)
-            if overfit:
+            if self.overfit:
                 self._model.stop_training = True
                 #LOG.info('Model is stopped training due to overfitting at epoch {:d}'. format(epoch))
                 save_dir = ops.join(self._model_save_dir, 'lanenet_{}_miou={:.4f}'.format(log_time, train_epoch_miou))
-                inp = tf.keras.layers.Input([256,512,3])
-                model = self._model(inp)
-                model = tf.keras.models.Model(inp, outputs=[model['binary_logits'], model['binary_prediction'], model['instance_prediction']])
-                model.save(save_dir)
+                #inp = tf.keras.layers.Input([256,512,3])
+                #model = self._model(inp)
+                #model = tf.keras.models.Model(inp, outputs=[model['binary_logits'], model['binary_prediction'], model['instance_prediction']])
+                self._model.save(save_dir, save_format='tf')
                 LOG.info('Model is stopped training due to overfitting at epoch {:d} and saved in {}'. format(epoch, save_dir))
                 exit()
             
             self.val_metrics.reset_states()
         
-        save_dir = ops.join(self._model_save_dir, 'lanenet_{}_miou={:.4f}'.format(log_time, train_epoch_miou))
-        self._model.save(save_dir)
+        save_dir = ops.join(self._model_save_dir, 'lanenet_{}_miou={:.4f}.h5'.format(log_time, train_epoch_miou))
+        # inp = Input([256,512,3])
+        # y = self._model(inp)
+        # out = Model(inp, y)
+        self._model.save_weights(save_dir)
+        #tf.keras.models.save_model(self._model, save_dir)
         LOG.info('Model is saved in {}'. format(save_dir))
     
     def save_checkpoint(self, miou):
@@ -371,7 +383,7 @@ class LRSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
             warmup_lr = (self._init_learning_rate - 0.000001) * \
                         (1 - step/self._train_epoch_steps)**(self._lr_polynimal_decay_power) + \
                         0.000001
-        
+        #print('LR: {}'.format(warmup_lr))
         return warmup_lr
 
 cfg = parse_config_utils.lanenet_cfg
