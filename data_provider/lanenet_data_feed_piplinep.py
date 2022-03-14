@@ -241,6 +241,45 @@ class LaneNetDataFeeder(object):
         if self._dataset_flags not in ['train', 'val']:
             raise ValueError('flags of the data feeder should be \'train\', \'val\'')
 
+        tfrecords_file_paths = ops.join(self._tfrecords_dir, 'tusimple_{:s}.tfrecords'.format(self._dataset_flags))
+        assert ops.exists(tfrecords_file_paths), '{:s} not exist'.format(tfrecords_file_paths)
+
+        with tf.device('/cpu:0'):
+
+            # TFRecordDataset opens a binary file and reads one record at a time.
+            # `tfrecords_file_paths` could also be a list of filenames, which will be read in order.
+            dataset = tf.data.TFRecordDataset(tfrecords_file_paths)
+
+            # The map transformation takes a function and applies it to every element
+            # of the dataset.
+            dataset = dataset.map(
+                map_func=tf_io_pipline_tools.decode,
+                num_parallel_calls=CFG.DATASET.CPU_MULTI_PROCESS_NUMS
+            )
+            if self._dataset_flags == 'train':
+                dataset = dataset.map(
+                    map_func=tf_io_pipline_tools.augment_for_train,
+                    num_parallel_calls=CFG.DATASET.CPU_MULTI_PROCESS_NUMS
+                )
+                batch_size = self._train_batch_size
+            elif self._dataset_flags == 'val':
+                dataset = dataset.map(
+                    map_func=tf_io_pipline_tools.augment_for_train,
+                    num_parallel_calls=CFG.DATASET.CPU_MULTI_PROCESS_NUMS
+                )
+                batch_size = self._val_batch_size
+            dataset = dataset.map(
+                map_func=tf_io_pipline_tools.normalize,
+                num_parallel_calls=CFG.DATASET.CPU_MULTI_PROCESS_NUMS
+            )
+            dataset = dataset.shuffle(buffer_size=512)
+
+            # repeat num epochs
+            #dataset = dataset.repeat(self._epoch_nums)
+
+            dataset = dataset.batch(batch_size=batch_size, drop_remainder=True)
+            self.dataset = dataset.prefetch(buffer_size=128)
+
     def __len__(self):
         """
 
@@ -259,8 +298,11 @@ class LaneNetDataFeeder(object):
         else:
             raise ValueError('Wrong dataset flags')
         return num_batchs
-
-    def next_batch(self, batch_size):
+    
+    def dataset(self):
+        return self.dataset
+        
+    def next_batch(self):
         """
         dataset feed pipline input
         :param batch_size:
@@ -270,49 +312,13 @@ class LaneNetDataFeeder(object):
                     * labels is an int32 tensor with shape [batch_size] with the true label,
                       a number in the range [0, CLASS_NUMS).
         """
-        tfrecords_file_paths = ops.join(self._tfrecords_dir, 'tusimple_{:s}.tfrecords'.format(self._dataset_flags))
-        assert ops.exists(tfrecords_file_paths), '{:s} not exist'.format(tfrecords_file_paths)
-
-        with tf.device('/cpu:0'):
-            with tf.name_scope('input_tensor'):
-
-                # TFRecordDataset opens a binary file and reads one record at a time.
-                # `tfrecords_file_paths` could also be a list of filenames, which will be read in order.
-                dataset = tf.data.TFRecordDataset(tfrecords_file_paths)
-
-                # The map transformation takes a function and applies it to every element
-                # of the dataset.
-                dataset = dataset.map(
-                    map_func=tf_io_pipline_tools.decode,
-                    num_parallel_calls=CFG.DATASET.CPU_MULTI_PROCESS_NUMS
-                )
-                if self._dataset_flags == 'train':
-                    dataset = dataset.map(
-                        map_func=tf_io_pipline_tools.augment_for_train,
-                        num_parallel_calls=CFG.DATASET.CPU_MULTI_PROCESS_NUMS
-                    )
-                elif self._dataset_flags == 'val':
-                    dataset = dataset.map(
-                        map_func=tf_io_pipline_tools.augment_for_test,
-                        num_parallel_calls=CFG.DATASET.CPU_MULTI_PROCESS_NUMS
-                    )
-                dataset = dataset.map(
-                    map_func=tf_io_pipline_tools.normalize,
-                    num_parallel_calls=CFG.DATASET.CPU_MULTI_PROCESS_NUMS
-                )
-                dataset = dataset.shuffle(buffer_size=512)
-
-                # repeat num epochs
-                #dataset = dataset.repeat(self._epoch_nums)
-
-                dataset = dataset.batch(batch_size=batch_size, drop_remainder=True)
-                dataset = dataset.prefetch(buffer_size=128)
+        
 
                 #iterator = dataset.make_one_shot_iterator()
                 #print(iterator)
-                iterator = iter(dataset)
+        iterator = iter(self.dataset)
 
-        return iterator.get_next()
+        return next(iterator)
 
 
 if __name__ == '__main__':
