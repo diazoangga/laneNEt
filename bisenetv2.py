@@ -1,8 +1,11 @@
 from selectors import DefaultSelector
 import tensorflow as tf
-from tensorflow.keras.layers import UpSampling2D, GlobalAveragePooling2D, AveragePooling2D, Add, Conv2D, Input, DepthwiseConv2D, BatchNormalization, ReLU, Layer, MaxPool2D
+from tensorflow.keras.layers import UpSampling2D, GlobalAveragePooling2D, AveragePooling2D, Add, Dropout, Conv2D, Input, DepthwiseConv2D, BatchNormalization, ReLU, Layer, MaxPool2D
 from tensorflow.keras import Model
 
+tf.random.set_seed(40)
+
+dropout = 0.2
 class BiseNetV2(Model):
     def __init__(self):
         super(BiseNetV2, self).__init__()
@@ -17,16 +20,28 @@ class BiseNetV2(Model):
         s_branch = self.semantic_branch(input_tensor)
         agg_brang = self.aggregation_branch(d_branch, s_branch)
         
-        bin_logits = self.bin_segmentation(agg_brang)
-        bin_pred = tf.argmax(tf.nn.softmax(bin_logits, axis=-1))
+        bin_pred = self.bin_segmentation(agg_brang)
         inst_seg = self.inst_segmentation(agg_brang)
+        #print(s_branch)
         
-        return {
-            'binary_logits': bin_logits, 
-            'binary_prediction': bin_pred, 
-            'instance_prediction': inst_seg
-            }
+        return [bin_pred, inst_seg]
 
+    def get_config(self):
+        cfg = super(BiseNetV2, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg  
+
+    def build_model(self, in_shape):
+        input_layer = Input(shape=in_shape)
+        out_layer = BiseNetV2()(input_layer)
+
+        return Model(input_layer, out_layer)
 
 class ConvBlock(Layer):
     def __init__(self, out_ch, kernel_size, strides, padding, activation=True):
@@ -34,12 +49,27 @@ class ConvBlock(Layer):
         self.activation = activation
         self.conv2d = Conv2D(out_ch, kernel_size, strides, padding)
         self.bn = BatchNormalization()
-        self.relu = ReLU()
+        if activation:
+            self.relu = ReLU()
+            self.dropout = Dropout(dropout)
+
+    def get_config(self):
+        cfg = super(ConvBlock, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
+
     def call(self, input_tensors):
         conv = self.conv2d(input_tensors)
         bn = self.bn(conv)
         if self.activation:
             out = self.relu(bn)
+            out = self.dropout(out)
         else:
             out = bn
         return out
@@ -52,6 +82,17 @@ class StemBlock(Layer):
         self.conv_1_2 = ConvBlock(out_ch, 3, 2, padding='SAME')
         self.mpool_2_0 = MaxPool2D(pool_size=(3,3), strides=2, padding='SAME')
         self.conv_0_2 = ConvBlock(out_ch, 3, 1, padding='SAME')
+
+    def get_config(self):
+        cfg = super(StemBlock, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
 
     def call(self, input_tensor):
         share = self.conv_0_1(input_tensor)
@@ -81,6 +122,17 @@ class GatherExpansion(Layer):
             self.stride2_sub_dw_2 = DWBlock(3, strides=1, d_multiplier=1, padding='SAME')
             self.stride2_sub_conv_2 = ConvBlock(out_ch, 3, 1, padding='SAME', activation=False)
     
+    def get_config(self):
+        cfg = super(GatherExpansion, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
+
     def call(self, input_tensor):
         if self.strides == 1:
             branch = self.stride1_conv_1(input_tensor)
@@ -110,6 +162,18 @@ class DWBlock(Layer):
         self.dw_conv = DepthwiseConv2D(k_size, strides=strides, depth_multiplier=d_multiplier,
                                         padding=padding)
         self.bn = BatchNormalization()
+    
+    def get_config(self):
+        cfg = super(DWBlock, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
+
     def call(self, input_tensor):
         out = self.dw_conv(input_tensor)
         out = self.bn(out)
@@ -124,10 +188,21 @@ class ContextEmbedding(Layer):
         self.conv_1 = ConvBlock(out_ch, 1, strides=1, padding='SAME')
         self.conv_2 = Conv2D(out_ch, 3, strides=1, padding='SAME')
 
+    def get_config(self):
+        cfg = super(ContextEmbedding, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
+
     def call(self, input_tensor):
         out = self.ga_pool(input_tensor)
         out = self.ga_pool_bn(out)
-        #print(out.get_shape())
+        #print(out)
         out = self.conv_1(out)
         out = Add()([out, input_tensor])
         out = self.conv_2(out)
@@ -156,6 +231,17 @@ class DetailBranch(Layer):
                 for r in range(repeat):
                     self.layer['self.{}_{}_{}_conv'.format(stage_idx, idx, r)] = ConvBlock(out_ch, k_size, strides, padding='SAME')
     
+    def get_config(self):
+        cfg = super(DetailBranch, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
+
     def call(self, input_tensor):
         out = input_tensor
         layer = sorted(self.layer)
@@ -197,11 +283,24 @@ class SemanticBranch(Layer):
                         self.layer['self.{}_{}_{}_{}'.format(stage_idx, idx, opr_type, r)] =\
                             ContextEmbedding(out_ch)
                     temp = out_ch
+
+    def get_config(self):
+        cfg = super(SemanticBranch, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
+
     def call(self, input_tensors):
         out = input_tensors
         layer = sorted(self.layer)
         for item in layer:
             out = self.layer[item](out)
+            #print(f'{item}:\n{out.numpy()}')
         return out
 
 class AggregationBranch(Layer):
@@ -217,7 +316,18 @@ class AggregationBranch(Layer):
         self.s_branch_2_upsample = UpSampling2D(size=(4,4), interpolation='bilinear')
         self.s_branch_3_upsample = UpSampling2D(size=(4,4), interpolation='bilinear')
         self.main_conv = ConvBlock(out_ch, 3, strides=1, padding='SAME', activation=False)
-        
+    
+    def get_config(self):
+        cfg = super(AggregationBranch, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
+
     def call(self, detail_branch, semantic_branch):
         d_branch_main = self.d_branch_1_dw(detail_branch)
         d_branch_main = self.d_branch_1_conv(d_branch_main)
@@ -241,18 +351,31 @@ class AggregationBranch(Layer):
 class BinarySegmentation(Layer):
     def __init__(self, cls_num):
         super(BinarySegmentation, self).__init__()
-        self.conv1 = ConvBlock(64, 1, strides=1, padding='SAME')
-        self.conv2 = ConvBlock(128, 1, strides=1, padding='SAME')
+        self.conv1 = ConvBlock(128, 1, strides=1, padding='SAME')
+        self.conv2 = ConvBlock(64, 1, strides=1, padding='SAME')
         self.conv3 = ConvBlock(cls_num, 1, strides=1, padding='SAME', activation=False)
         
         upsample_size = 8
         self.upsample = UpSampling2D(size=upsample_size, interpolation='bilinear')
-        
+        self.softmax = tf.keras.layers.Softmax(axis=-1, name='bin_seg')
+    
+    def get_config(self):
+        cfg = super(BinarySegmentation, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
+
     def call(self, input_tensor):
         out = self.conv1(input_tensor)
         out = self.conv2(out)
         out = self.conv3(out)
         out = self.upsample(out)
+        out = self.softmax(out)
         
         return out
 
@@ -260,13 +383,24 @@ class BinarySegmentation(Layer):
 class InstanceSegmentation(Layer):
     def __init__(self, inst_n):
         super(InstanceSegmentation, self).__init__()
-        self.conv1 = ConvBlock(64, 1, strides=1, padding='SAME')
-        self.conv2 = ConvBlock(128, 1, strides=1, padding='SAME')
+        self.conv1 = ConvBlock(128, 1, strides=1, padding='SAME')
+        self.conv2 = ConvBlock(64, 1, strides=1, padding='SAME')
         self.conv3 = ConvBlock(inst_n, 1, strides=1, padding='SAME', activation=False)
         
         upsample_size = 8
-        self.upsample = UpSampling2D(size=upsample_size, interpolation='bilinear')
-        
+        self.upsample = UpSampling2D(size=upsample_size, interpolation='bilinear', name='inst_seg')
+    
+    def get_config(self):
+        cfg = super(InstanceSegmentation, self).get_config()
+        cfg.update({
+            'node_def': self.node_def.SerializeToString(),
+            'node_def': self.node_def.SerializeToString().decode('utf-8'),
+            'constants': {
+                i: tf.keras.backend.get_value(c) for i, c in self.constants.items()
+            }
+        })
+        return cfg
+
     def call(self, input_tensor):
         out = self.conv1(input_tensor)
         out = self.conv2(out)
